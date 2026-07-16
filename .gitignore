@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Downloaded by scripts/install_hayabusa.sh
+hayabusa/
