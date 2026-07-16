@@ -106,7 +106,7 @@ def scan_evtx(file_path: str, min_severity: str | None = None) -> dict[str, Any]
         ScanError: if the file is missing, Hayabusa isn't installed,
             min_severity is invalid, or the scan itself fails.
     """
-    evtx_path = Path(file_path).expanduser()
+    evtx_path = Path(file_path).expanduser().resolve()
     if not evtx_path.exists():
         raise ScanError(f"EVTX file not found: {evtx_path}")
     if not evtx_path.is_file():
