@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Implemented. `server.py` runs a working MCP server exposing the `scan_evtx` tool.
+Implemented. `server.py` runs a working MCP server exposing the `scan_evtx` and `get_hayabusa_rules` tools.
 
 ## Project Overview
 
@@ -14,6 +14,7 @@ This project is an MCP (Model Context Protocol) server that wraps [Hayabusa](htt
 
 - Python, using the `mcp` library's low-level `Server` API (`mcp.server.lowlevel.Server`) — chosen over `FastMCP` for explicit control over tool schema and result construction
 - Hayabusa CLI, installed locally under `hayabusa/`, invoked as a subprocess
+- `pyyaml`, used to parse rule definition files under `hayabusa/rules/` for `get_hayabusa_rules`
 
 ## Setup
 
@@ -28,7 +29,9 @@ scripts/install_hayabusa.sh   # downloads the Hayabusa release for this platform
 - `server.py`
   - `scan_evtx(file_path, min_severity=None) -> dict`: the actual scan logic, independent of MCP. Validates the EVTX file exists, shells out to the Hayabusa binary (`hayabusa/hayabusa`, a symlink managed by the install script) running `json-timeline -f <file> -o <tmp>` with `-w -q -Q -K -C` (no wizard/banner/error-log/color, clobber output), run with `cwd=HAYABUSA_DIR` so Hayabusa's default relative rule paths (`./rules`, `./rules/config`) resolve. Parses the resulting JSON array from a temp file, filters by `Level` against `min_severity` (rank order: informational < low < medium < high < critical), and returns `{file, min_severity, total_findings, findings}`.
   - `ScanError`: raised for missing file, missing Hayabusa binary, invalid `min_severity`, non-zero/timeout subprocess exit, or unparseable output. Caught in the tool layer and turned into an MCP error result (`isError=True`) rather than propagating.
-  - `list_tools()` / `call_tool()`: registered via `@server.list_tools()` / `@server.call_tool()` decorators on the low-level `Server` instance. `call_tool` dispatches by tool name, calls `scan_evtx`, and returns either the result dict (auto-serialized to JSON text + `structuredContent` by the low-level API) or a `CallToolResult(isError=True)` on `ScanError`.
+  - `get_hayabusa_rules(keyword=None, limit=100) -> dict`: lists Hayabusa/Sigma detection rules so a caller can see what's available before scanning. Recursively globs `hayabusa/rules/**/*.yml` (via `_iter_rule_summaries`), parses each with `yaml.safe_load`, and skips files that fail to parse or lack a `title`/`id` (e.g. files under `rules/config/`). Each summary carries `id`, `title`, `level`, `status`, `description`, `tags`, and `path` (relative to `hayabusa/rules/`). If `keyword` is given, does a case-insensitive substring match against title/description/id/tags. Results are capped by `limit` (default 100); the response reports `total_matches` (before truncation) vs `returned` so callers know if results were cut off. Returns `{keyword, total_matches, returned, rules}`.
+  - `RulesError`: raised for a missing rules directory or invalid `limit`. Caught the same way as `ScanError`.
+  - `list_tools()` / `call_tool()`: registered via `@server.list_tools()` / `@server.call_tool()` decorators on the low-level `Server` instance. `call_tool` dispatches by tool name to `scan_evtx` or `get_hayabusa_rules`, and returns either the result dict (auto-serialized to JSON text + `structuredContent` by the low-level API) or a `CallToolResult(isError=True)` on `ScanError`/`RulesError`.
   - `main()` wires stdio transport (`mcp.server.stdio.stdio_server`) and runs the server loop.
 
 ## Testing

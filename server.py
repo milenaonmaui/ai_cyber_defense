@@ -11,12 +11,16 @@ from typing import Any
 
 import mcp.server.stdio
 import mcp.types as types
+import yaml
 from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 
 BASE_DIR = Path(__file__).resolve().parent
 HAYABUSA_DIR = BASE_DIR / "hayabusa"
 HAYABUSA_BIN = HAYABUSA_DIR / "hayabusa"
+RULES_DIR = HAYABUSA_DIR / "rules"
+
+DEFAULT_RULES_LIMIT = 100
 
 # Ordered from least to most severe, matching Hayabusa's rule levels.
 SEVERITY_LEVELS = ["informational", "low", "medium", "high", "critical"]
@@ -24,6 +28,10 @@ SEVERITY_LEVELS = ["informational", "low", "medium", "high", "critical"]
 
 class ScanError(Exception):
     """Raised when scan_evtx cannot produce a result."""
+
+
+class RulesError(Exception):
+    """Raised when get_hayabusa_rules cannot produce a result."""
 
 
 def _severity_rank(level: str) -> int:
@@ -138,6 +146,88 @@ def scan_evtx(file_path: str, min_severity: str | None = None) -> dict[str, Any]
     }
 
 
+def _iter_rule_summaries() -> list[dict[str, Any]]:
+    """Parse every rule YAML file under RULES_DIR into a compact summary dict.
+
+    Files that fail to parse as YAML, or don't look like rule definitions
+    (no title/id), are silently skipped rather than failing the whole scan.
+    """
+    summaries = []
+    for rule_path in sorted(RULES_DIR.rglob("*.yml")):
+        try:
+            data = yaml.safe_load(rule_path.read_text())
+        except yaml.YAMLError:
+            continue
+
+        if not isinstance(data, dict) or "title" not in data or "id" not in data:
+            continue
+
+        tags = data.get("tags") or []
+        if not isinstance(tags, list):
+            tags = [tags]
+
+        summaries.append(
+            {
+                "id": data.get("id"),
+                "title": data.get("title"),
+                "level": data.get("level"),
+                "status": data.get("status"),
+                "description": (data.get("description") or "").strip(),
+                "tags": tags,
+                "path": str(rule_path.relative_to(RULES_DIR)),
+            }
+        )
+
+    return summaries
+
+
+def get_hayabusa_rules(
+    keyword: str | None = None, limit: int = DEFAULT_RULES_LIMIT
+) -> dict[str, Any]:
+    """List available Hayabusa detection rules, optionally filtered by keyword.
+
+    Args:
+        keyword: Optional case-insensitive substring to match against a
+            rule's title, description, tags, or id.
+        limit: Maximum number of matching rules to return (default 100).
+
+    Raises:
+        RulesError: if the rules directory is missing or limit is invalid.
+    """
+    if not RULES_DIR.exists():
+        raise RulesError(
+            f"Hayabusa rules directory not found: {RULES_DIR}. "
+            "Run scripts/install_hayabusa.sh to install it."
+        )
+    if limit < 1:
+        raise RulesError(f"Invalid limit {limit!r}: must be a positive integer")
+
+    all_rules = _iter_rule_summaries()
+
+    if keyword:
+        needle = keyword.lower()
+
+        def _matches(rule: dict[str, Any]) -> bool:
+            haystacks = [
+                str(rule.get("title") or ""),
+                str(rule.get("description") or ""),
+                str(rule.get("id") or ""),
+                " ".join(rule.get("tags") or []),
+            ]
+            return any(needle in h.lower() for h in haystacks)
+
+        matches = [r for r in all_rules if _matches(r)]
+    else:
+        matches = all_rules
+
+    return {
+        "keyword": keyword,
+        "total_matches": len(matches),
+        "returned": min(len(matches), limit),
+        "rules": matches[:limit],
+    }
+
+
 server = Server("hayabusa")
 
 
@@ -162,21 +252,43 @@ async def list_tools() -> list[types.Tool]:
                 },
                 "required": ["file_path"],
             },
-        )
+        ),
+        types.Tool(
+            name="get_hayabusa_rules",
+            description="List available Hayabusa detection rules, optionally filtered by a keyword matched against title, description, tags, or id.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "keyword": {
+                        "type": "string",
+                        "description": "Case-insensitive substring to filter rules by (matched against title, description, tags, and id).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": f"Maximum number of matching rules to return (default {DEFAULT_RULES_LIMIT}).",
+                        "minimum": 1,
+                    },
+                },
+            },
+        ),
     ]
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any] | types.CallToolResult:
-    if name != "scan_evtx":
-        raise ValueError(f"Unknown tool: {name}")
-
     try:
-        return scan_evtx(
-            file_path=arguments["file_path"],
-            min_severity=arguments.get("min_severity"),
-        )
-    except ScanError as exc:
+        if name == "scan_evtx":
+            return scan_evtx(
+                file_path=arguments["file_path"],
+                min_severity=arguments.get("min_severity"),
+            )
+        if name == "get_hayabusa_rules":
+            return get_hayabusa_rules(
+                keyword=arguments.get("keyword"),
+                limit=arguments.get("limit", DEFAULT_RULES_LIMIT),
+            )
+        raise ValueError(f"Unknown tool: {name}")
+    except (ScanError, RulesError) as exc:
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=str(exc))],
             isError=True,
