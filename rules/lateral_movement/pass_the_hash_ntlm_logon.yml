@@ -1,0 +1,38 @@
+title: Potential Pass-the-Hash Activity via NTLM Network Logon
+id: 9de0dcdc-cd1f-4565-b335-1a159e398abd
+status: test
+description: |
+    Detects a Type 3 (Network) logon authenticated via NTLM where the logon process is
+    "NtLmSsp" and no Kerberos pre-authentication took place, combined with the source IP
+    being a workstation rather than the expected authentication server. This pattern is
+    typical of Pass-the-Hash: an adversary authenticates using a stolen NTLM hash without
+    ever knowing the plaintext password.
+references:
+    - https://attack.mitre.org/techniques/T1550/002/
+    - https://www.thehacker.recipes/ad/movement/ntlm/pth
+author: detection-engineering-kb
+date: 2026-07-19
+tags:
+    - attack.lateral-movement
+    - attack.t1550.002
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4624
+        LogonType: 3
+        AuthenticationPackageName: 'NTLM'
+        LogonProcessName: 'NtLmSsp'
+    filter_anonymous:
+        TargetUserName: 'ANONYMOUS LOGON'
+    filter_localhost:
+        IpAddress:
+            - '127.0.0.1'
+            - '::1'
+            - '-'
+    condition: selection and not 1 of filter_*
+falsepositives:
+    - Legacy applications and devices that only support NTLM authentication
+    - Non-domain-joined or workgroup environments where NTLM is the norm
+level: medium

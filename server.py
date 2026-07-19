@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import subprocess
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -14,13 +16,22 @@ import mcp.types as types
 import yaml
 from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
+from mcp.types import AnyUrl
 
 BASE_DIR = Path(__file__).resolve().parent
 HAYABUSA_DIR = BASE_DIR / "hayabusa"
 HAYABUSA_BIN = HAYABUSA_DIR / "hayabusa"
 RULES_DIR = HAYABUSA_DIR / "rules"
+SIGMA_RULES_DIR = BASE_DIR / "rules"
+ATTACK_TECHNIQUES_PATH = BASE_DIR / "mappings" / "attack_techniques.json"
 
 DEFAULT_RULES_LIMIT = 100
+
+TECHNIQUE_TAG_RE = re.compile(r"attack\.(t\d{4}(?:\.\d{3})?)", re.IGNORECASE)
+
+# A technique needs at least one rule with this status to count as fully "covered"
+# rather than merely "partial" (rules exist but aren't yet considered production-ready).
+STABLE_RULE_STATUSES = {"stable"}
 
 # Ordered from least to most severe, matching Hayabusa's rule levels.
 SEVERITY_LEVELS = ["informational", "low", "medium", "high", "critical"]
@@ -32,6 +43,10 @@ class ScanError(Exception):
 
 class RulesError(Exception):
     """Raised when get_hayabusa_rules cannot produce a result."""
+
+
+class ResourceError(Exception):
+    """Raised when a detection:// resource cannot be resolved."""
 
 
 def _severity_rank(level: str) -> int:
@@ -228,6 +243,146 @@ def get_hayabusa_rules(
     }
 
 
+def _extract_techniques(tags: list[str]) -> list[str]:
+    """Pull normalized ATT&CK technique IDs (e.g. 'T1003.001') out of a rule's tags."""
+    techniques = []
+    for tag in tags:
+        match = TECHNIQUE_TAG_RE.fullmatch(str(tag))
+        if match:
+            techniques.append(match.group(1).upper())
+    return techniques
+
+
+def _iter_sigma_rules() -> list[dict[str, Any]]:
+    """Parse every Sigma rule YAML file under SIGMA_RULES_DIR into a summary dict.
+
+    Files that fail to parse as YAML, or don't look like rule definitions
+    (no title/id), are silently skipped.
+    """
+    rules = []
+    for rule_path in sorted(SIGMA_RULES_DIR.rglob("*.yml")):
+        try:
+            data = yaml.safe_load(rule_path.read_text())
+        except yaml.YAMLError:
+            continue
+
+        if not isinstance(data, dict) or "title" not in data or "id" not in data:
+            continue
+
+        tags = data.get("tags") or []
+        if not isinstance(tags, list):
+            tags = [tags]
+
+        rules.append(
+            {
+                "rule_name": rule_path.stem,
+                "id": data.get("id"),
+                "title": data.get("title"),
+                "level": data.get("level"),
+                "status": data.get("status"),
+                "description": (data.get("description") or "").strip(),
+                "tags": tags,
+                "techniques": _extract_techniques(tags),
+                "path": str(rule_path.relative_to(SIGMA_RULES_DIR)),
+            }
+        )
+
+    return rules
+
+
+def _find_sigma_rule_path(rule_name: str) -> Path | None:
+    for rule_path in SIGMA_RULES_DIR.rglob("*.yml"):
+        if rule_path.stem == rule_name:
+            return rule_path
+    return None
+
+
+def list_sigma_rules() -> dict[str, Any]:
+    """List all Sigma rules under SIGMA_RULES_DIR. Backs the detection://rules resource."""
+    if not SIGMA_RULES_DIR.exists():
+        raise ResourceError(f"Sigma rules directory not found: {SIGMA_RULES_DIR}")
+
+    rules = _iter_sigma_rules()
+    return {"total": len(rules), "rules": rules}
+
+
+def get_sigma_rule(rule_name: str) -> str:
+    """Return the raw YAML text of a single Sigma rule. Backs detection://rules/{rule_name}."""
+    if not SIGMA_RULES_DIR.exists():
+        raise ResourceError(f"Sigma rules directory not found: {SIGMA_RULES_DIR}")
+
+    rule_path = _find_sigma_rule_path(rule_name)
+    if rule_path is None:
+        raise ResourceError(f"No Sigma rule named {rule_name!r} found under {SIGMA_RULES_DIR}")
+
+    return rule_path.read_text()
+
+
+def list_sigma_rules_by_technique(technique_id: str) -> dict[str, Any]:
+    """List Sigma rules tagged with the given ATT&CK technique.
+
+    Backs detection://rules/by-technique/{technique_id}.
+    """
+    if not SIGMA_RULES_DIR.exists():
+        raise ResourceError(f"Sigma rules directory not found: {SIGMA_RULES_DIR}")
+
+    needle = technique_id.upper()
+    matches = [r for r in _iter_sigma_rules() if needle in r["techniques"]]
+    return {"technique_id": needle, "total": len(matches), "rules": matches}
+
+
+@lru_cache(maxsize=1)
+def _load_attack_techniques() -> dict[str, dict[str, Any]]:
+    """Load the pre-built ATT&CK technique reference data.
+
+    Generated offline by scripts/build_attack_mappings.py from the MITRE
+    ATT&CK STIX bundle, since that bundle is ~50MB and the server shouldn't
+    need network access at request time.
+    """
+    if not ATTACK_TECHNIQUES_PATH.exists():
+        raise ResourceError(
+            f"ATT&CK technique mapping not found: {ATTACK_TECHNIQUES_PATH}. "
+            "Run scripts/build_attack_mappings.py to generate it."
+        )
+    return json.loads(ATTACK_TECHNIQUES_PATH.read_text())
+
+
+def get_attack_technique(technique_id: str) -> dict[str, Any]:
+    """Return ATT&CK technique info plus our detection coverage for it.
+
+    Backs detection://attack/techniques/{technique_id}. Coverage is:
+      - "gap": no Sigma rule under rules/ is tagged with this technique
+      - "partial": rules exist, but none have status "stable"
+      - "covered": at least one matching rule has status "stable"
+    """
+    needle = technique_id.upper()
+    techniques = _load_attack_techniques()
+    technique = techniques.get(needle)
+    if technique is None:
+        raise ResourceError(f"Unknown ATT&CK technique id: {needle!r}")
+
+    matching_rules = [r for r in _iter_sigma_rules() if needle in r["techniques"]]
+
+    if not matching_rules:
+        coverage = "gap"
+    elif any(r["status"] in STABLE_RULE_STATUSES for r in matching_rules):
+        coverage = "covered"
+    else:
+        coverage = "partial"
+
+    return {
+        "technique_id": needle,
+        "name": technique["name"],
+        "description": technique["description"],
+        "tactics": technique["tactics"],
+        "platforms": technique["platforms"],
+        "url": technique["url"],
+        "is_subtechnique": technique["is_subtechnique"],
+        "coverage": coverage,
+        "detecting_rules": matching_rules,
+    }
+
+
 server = Server("hayabusa")
 
 
@@ -293,6 +448,66 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any] | ty
             content=[types.TextContent(type="text", text=str(exc))],
             isError=True,
         )
+
+
+@server.list_resources()
+async def list_resources() -> list[types.Resource]:
+    return [
+        types.Resource(
+            uri=AnyUrl("detection://rules"),
+            name="All Sigma Detection Rules",
+            description="Summary list of every Sigma detection rule under rules/.",
+            mimeType="application/json",
+        ),
+    ]
+
+
+@server.list_resource_templates()
+async def list_resource_templates() -> list[types.ResourceTemplate]:
+    return [
+        types.ResourceTemplate(
+            uriTemplate="detection://rules/{rule_name}",
+            name="Sigma Rule By Name",
+            description="Raw YAML content of a single Sigma rule, addressed by its filename without the .yml extension.",
+            mimeType="text/yaml",
+        ),
+        types.ResourceTemplate(
+            uriTemplate="detection://rules/by-technique/{technique_id}",
+            name="Sigma Rules By ATT&CK Technique",
+            description="Summary list of Sigma rules tagged with the given ATT&CK technique ID, e.g. T1003.001.",
+            mimeType="application/json",
+        ),
+        types.ResourceTemplate(
+            uriTemplate="detection://attack/techniques/{technique_id}",
+            name="ATT&CK Technique Detection Coverage",
+            description="ATT&CK technique name/description plus which of our Sigma rules detect it and a coverage assessment (covered, partial, gap).",
+            mimeType="application/json",
+        ),
+    ]
+
+
+@server.read_resource()
+async def read_resource(uri: AnyUrl) -> str:
+    uri_str = str(uri)
+    prefix = "detection://"
+    if not uri_str.startswith(prefix):
+        raise ValueError(f"Unsupported resource URI scheme: {uri_str}")
+
+    parts = [p for p in uri_str[len(prefix):].split("/") if p]
+
+    try:
+        if parts == ["rules"]:
+            return json.dumps(list_sigma_rules(), indent=2)
+        if len(parts) == 3 and parts[0:2] == ["rules", "by-technique"]:
+            return json.dumps(list_sigma_rules_by_technique(parts[2]), indent=2)
+        if len(parts) == 2 and parts[0] == "rules":
+            return get_sigma_rule(parts[1])
+        if len(parts) == 3 and parts[0:2] == ["attack", "techniques"]:
+            return json.dumps(get_attack_technique(parts[2]), indent=2)
+    except ResourceError as exc:
+        raise ValueError(str(exc)) from exc
+
+    raise ValueError(f"Unknown resource URI: {uri_str}")
 
 
 async def _main() -> None:

@@ -1,0 +1,32 @@
+title: Possible Kerberoasting via RC4 TGS Ticket Request
+id: 9cec7689-cd1b-4fb2-8b6a-2e018ebdd6bc
+status: test
+description: |
+    Detects Kerberos service ticket (TGS) requests using the weak RC4 (etype 0x17) encryption
+    type for accounts with a Service Principal Name (SPN) set. Adversaries request TGS tickets
+    for SPN accounts and crack the RC4-encrypted ticket offline to recover the service
+    account's plaintext password (Kerberoasting).
+references:
+    - https://attack.mitre.org/techniques/T1558/003/
+    - https://adsecurity.org/?p=3458
+author: detection-engineering-kb
+date: 2026-07-19
+tags:
+    - attack.credential-access
+    - attack.t1558.003
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4769
+        TicketEncryptionType: '0x17'
+    filter_machine_accounts:
+        ServiceName|endswith: '$'
+    filter_krbtgt:
+        ServiceName: 'krbtgt'
+    condition: selection and not 1 of filter_*
+falsepositives:
+    - Legacy applications or devices that only support RC4 Kerberos encryption
+    - Misconfigured environments where AES is not enabled on service accounts
+level: medium

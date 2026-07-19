@@ -1,0 +1,35 @@
+title: Potential DCSync Attack Against Active Directory
+id: 65a0f1fe-891e-4ce1-a01b-fdd8348d748b
+status: stable
+description: |
+    Detects Directory Service replication requests (DS-Replication-Get-Changes /
+    DS-Replication-Get-Changes-All / DS-Replication-Get-Changes-In-Filtered-Set) made by a
+    security principal that is not a Domain Controller computer account. Tools like Mimikatz
+    (lsadump::dcsync) and Impacket's secretsdump abuse legitimate AD replication rights, once
+    granted, to pull password hashes for any account (including krbtgt) without touching the
+    DC's LSASS process.
+references:
+    - https://attack.mitre.org/techniques/T1003/006/
+    - https://adsecurity.org/?p=1729
+author: detection-engineering-kb
+date: 2026-07-19
+tags:
+    - attack.credential-access
+    - attack.t1003.006
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4662
+        Properties|contains:
+            - '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2'  # DS-Replication-Get-Changes
+            - '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2'  # DS-Replication-Get-Changes-All
+            - '89e95b76-444d-4c62-991a-0facbeda640c'  # DS-Replication-Get-Changes-In-Filtered-Set
+    filter_domain_controllers:
+        SubjectUserName|endswith: '$'
+    condition: selection and not filter_domain_controllers
+falsepositives:
+    - Legitimate Domain Controllers and Azure AD Connect / directory-sync service accounts
+    - Backup solutions with delegated directory replication rights
+level: high
