@@ -1,0 +1,48 @@
+title: LSASS Memory Access via MiniDump
+id: 12e045c4-55b7-4fac-aa16-5ff4229f987e
+status: experimental
+description: |
+    Detects process command lines consistent with dumping LSASS process memory via the Windows
+    MiniDump API, including the built-in comsvcs.dll MiniDump export invoked through rundll32.exe,
+    ProcDump run against lsass.exe with a full/mini dump flag, and other tools that reference
+    MiniDumpWriteDump against lsass.exe. LSASS memory dumps are typically exfiltrated and parsed
+    offline (e.g. with Mimikatz) to recover plaintext credentials, NTLM hashes, and Kerberos
+    tickets.
+    Severity: high - a process command line combining a dump utility/API with lsass.exe is a
+    strong, low-noise indicator of credential theft staging; legitimate administration rarely
+    needs to dump LSASS this way outside of sanctioned troubleshooting, so matches warrant
+    immediate triage.
+author: Detection Engineering
+date: 2026-07-20
+tags:
+    - attack.credential-access
+    - attack.t1003.001
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    selection_comsvcs_minidump:
+        Image|endswith: '\rundll32.exe'
+        CommandLine|contains|all:
+            - 'comsvcs.dll'
+            - 'MiniDump'
+    selection_procdump_lsass:
+        Image|endswith:
+            - '\procdump.exe'
+            - '\procdump64.exe'
+        CommandLine|contains: 'lsass'
+        CommandLine|re: '(?i)(^|\s)-m[ap]\b'
+    selection_api_reference:
+        CommandLine|contains|all:
+            - 'MiniDumpWriteDump'
+            - 'lsass'
+    condition: 1 of selection_*
+falsepositives:
+    - Administrators or support staff running ProcDump against lsass.exe for legitimate
+      troubleshooting or memory forensics under change control
+    - EDR, AV, or backup/monitoring agents that legitimately invoke comsvcs.dll MiniDump or
+      MiniDumpWriteDump for sanctioned diagnostics
+    - Authorized red team or purple team exercises exercising credential-access tradecraft
+level: high
+# Test case: test_samples/lsass_memory_dump_minidump.xml (synthetic Sysmon EventID 1
+# record) is expected to match via selection_comsvcs_minidump.
