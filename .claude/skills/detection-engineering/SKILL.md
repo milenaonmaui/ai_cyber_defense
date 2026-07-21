@@ -43,6 +43,23 @@ suggestions.
    the resource identifier for `detection://rules/{rule_name}`), not necessarily the YAML `title`
    field, which can stay human-readable.
 
+## Validation
+
+After creating or modifying any rule under `rules/`, run it through
+`scripts/validate-rule.py` before considering the work done:
+
+```
+python3 .claude/skills/detection-engineering/scripts/validate-rule.py <path/to/rule.yml>
+```
+
+The script parses the rule and checks four of the five required standards above (ATT&CK
+tags, valid `level`, non-empty `falsepositives`, and a test-case comment referencing a
+sample), printing a JSON report and exiting non-zero if any check fails. It does not check
+standard 5 (filename convention) or cross-check that ATT&CK technique IDs actually exist —
+verify those manually. A rule isn't done until the script reports `"valid": true` (or every
+issue it raises has been consciously addressed or called out to the user, per the guidance
+below).
+
 ## When reviewing an existing rule
 
 Check all five items above in order and call out every violation found, not just the first one.
